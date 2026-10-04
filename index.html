@@ -1003,6 +1003,9 @@ const Local={
 const Online=(()=>{
   let fb=null,db=null,uid=null,offset=0,code=null,role=null,room=null,unsub=null,creating=false,starting=false;
   let serverG=null,pending=[];   // サーバで確定した状態と、送信中の自分の手
+  let swept=false,oppTimer=null;
+  // ルームの掃除条件（database.rules.json と同じ値にすること）
+  const ROOM_TTL_MS=24*60*60*1000, IDLE_MS=10*60*1000, OPP_GRACE_MS=10000;
   const CODE_CHARS='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const now=()=>Date.now()+offset;
   const R=p=>fb.ref(db,`rooms/${code}${p?'/'+p:''}`);
@@ -1027,6 +1030,40 @@ const Online=(()=>{
     const cred=await sdk.signInAnonymously(auth);
     uid=cred.user.uid;db=d;fb=sdk;
     fb.onValue(fb.ref(db,'.info/serverTimeOffset'),s=>{offset=s.val()||0});
+    // 通信が切れて戻ったら、自分をオンラインに戻す
+    let wasConnected=false;
+    fb.onValue(fb.ref(db,'.info/connected'),s=>{
+      if(s.val()===true){if(wasConnected&&code&&role)presence().catch(()=>{});wasConnected=true}
+    });
+    setTimeout(sweep,1500);
+  }
+  // 古いルームの掃除：作成から24時間以上、または両者オフラインのまま10分以上経ったルームを削除する
+  // （サーバ処理を使わず、遊びに来た人のブラウザが少しずつ掃除する。削除可否はルールで検証される）
+  async function sweep(){
+    if(swept)return;swept=true;
+    try{
+      const t=now();
+      const rooms=fb.ref(db,'rooms'),jobs=[];
+      const snaps=await Promise.all([
+        fb.get(fb.query(rooms,fb.orderByChild('meta/touchedAt'),fb.endAt(t-IDLE_MS),fb.limitToFirst(25))),
+        fb.get(fb.query(rooms,fb.orderByChild('meta/createdAt'),fb.endAt(t-ROOM_TTL_MS),fb.limitToFirst(25)))]);
+      const seen=new Set();
+      for(const snap of snaps)snap.forEach(ch=>{
+        if(seen.has(ch.key))return;seen.add(ch.key);
+        if(ch.key===code)return;
+        const v=ch.val()||{},m=v.meta||{},pl=v.players||{};
+        const expired=typeof m.createdAt==='number'&&m.createdAt<t-ROOM_TTL_MS;
+        const idle=!(pl.p1&&pl.p1.online===true)&&!(pl.p2&&pl.p2.online===true)&&!(m.touchedAt>=t-IDLE_MS);
+        if(expired||idle)jobs.push(fb.remove(ch.ref).catch(()=>{}));
+      });
+      await Promise.all(jobs);
+    }catch(e){console.warn('room sweep skipped:',e&&e.message)}
+  }
+  // 自分の在室状態を登録（切断時はサーバが online:false と最終更新時刻を書く）
+  async function presence(){
+    const ref=R(),me_=`players/${role}`;
+    await fb.onDisconnect(ref).update({[me_+'/online']:false,'meta/touchedAt':fb.serverTimestamp()});
+    await fb.update(ref,{[me_+'/online']:true,[me_+'/left']:null,'meta/touchedAt':fb.serverTimestamp()});
   }
   function genCode(){let s='';for(let i=0;i<4;i++)s+=CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)];return s}
 
@@ -1036,7 +1073,7 @@ const Online=(()=>{
       code=genCode();
       const res=await fb.runTransaction(R(),cur=>{
         if(cur)return;   // 既に使われているコード
-        return {meta:{mode:settings.mode,n:settings.n,visibility:settings.visibility,createdAt:now(),host:uid},players:{p1:{uid,online:true,rematch:false}}};
+        return {meta:{mode:settings.mode,n:settings.n,visibility:settings.visibility,createdAt:now(),touchedAt:now(),host:uid},players:{p1:{uid,online:true,rematch:false}}};
       },{applyLocally:false});
       if(res.committed){await enter('p1');return code}
     }
@@ -1058,9 +1095,7 @@ const Online=(()=>{
   }
   async function enter(r){
     role=r;me=r;opp=r==='p1'?'p2':'p1';
-    const onlineRef=R(`players/${role}/online`);
-    await fb.onDisconnect(onlineRef).set(false);
-    await fb.set(onlineRef,true);
+    await presence();
     unsub=fb.onValue(R(),snap=>handleRoom(snap.val()));
   }
   function handleRoom(v){
@@ -1072,7 +1107,7 @@ const Online=(()=>{
       const g=v.game;
       if(!g||(g.over&&p1.rematch&&p2.rematch)){
         creating=true;
-        fb.update(R(),{game:Engine.create(v.meta.mode,v.meta.n,now()+ONLINE_READY_MS),'players/p1/rematch':false,'players/p2/rematch':false})
+        fb.update(R(),{game:Engine.create(v.meta.mode,v.meta.n,now()+ONLINE_READY_MS),'players/p1/rematch':false,'players/p2/rematch':false,'meta/touchedAt':fb.serverTimestamp()})
           .finally(()=>{creating=false});
         return;   // update() はこの中で新しい状態の通知を同期的に発火するため、古い v で続きを処理しない
       }
@@ -1089,8 +1124,17 @@ const Online=(()=>{
     if(G.startAt!==ui.startAt)resetView();
     onState();
     const o=pl[opp];
-    if(o&&o.online===false)showResult('DISCONNECT','相手の接続が切れました。',null,'lose');
-    else if(G.over){
+    if(o&&o.left){clearTimeout(oppTimer);oppTimer=null;showResult('DISCONNECT','相手が退出しました。',null,'lose');return}
+    if(o&&o.online===false){
+      // 一時的な通信切れに備えて少し待つ
+      if(!oppTimer){
+        showBanner('RIVAL OFFLINE…','miss',OPP_GRACE_MS);
+        oppTimer=setTimeout(()=>{oppTimer=null;const q=room&&room.players&&room.players[opp];if(code&&q&&q.online===false)showResult('DISCONNECT','相手の接続が切れました。',null,'lose')},OPP_GRACE_MS);
+      }
+      return;
+    }
+    if(oppTimer){clearTimeout(oppTimer);oppTimer=null;showBanner('RIVAL BACK','',900)}
+    if(G.over){
       const mine=pl[me]||{};
       const sub=o&&o.rematch&&!mine.rematch?'相手が再戦を希望しています':mine.rematch?'相手の応答を待っています…':'';
       $('#resultSub').textContent=sub;
@@ -1125,15 +1169,17 @@ const Online=(()=>{
   function cleanup(){
     if(unsub){unsub();unsub=null}
     code=null;role=null;room=null;creating=false;starting=false;serverG=null;pending=[];
+    clearTimeout(oppTimer);oppTimer=null;
   }
   function leave(){
     if(!code||!fb){cleanup();return}
-    const c=code,r=role,hadGuest=room&&room.players&&room.players.p2;
+    const c=code,r=role,other=room&&room.players&&room.players[r==='p1'?'p2':'p1'];
     const ref=fb.ref(db,`rooms/${c}`);
-    fb.onDisconnect(fb.ref(db,`rooms/${c}/players/${r}/online`)).cancel();
+    fb.onDisconnect(ref).cancel();
     cleanup();
-    if(r==='p1'&&!hadGuest)fb.remove(ref);
-    else fb.set(fb.ref(db,`rooms/${c}/players/${r}/online`),false);
+    // 相手もいなければその場で削除、いれば退出を記録
+    if(!other||other.online!==true||other.left)fb.remove(ref).catch(()=>{});
+    else fb.update(ref,{[`players/${r}/online`]:false,[`players/${r}/left`]:true,'meta/touchedAt':fb.serverTimestamp()}).catch(()=>{});
   }
   return {kind:'online',now,create,join,play,again,leave,
     visibility:()=>room&&room.meta?room.meta.visibility:'total',
