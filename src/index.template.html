@@ -162,7 +162,7 @@ img{-webkit-user-drag:none;user-select:none;-webkit-user-select:none}
 .divider{height:1px;margin:14px 0 12px;background:linear-gradient(90deg,transparent,var(--line-2) 20%,var(--line-2) 80%,transparent)}
 .vis{transition:opacity .3s}
 .vis.disabled{opacity:.38;pointer-events:none}
-.vis .note{font:600 10px/1 var(--f-jp);color:var(--dim);margin-left:6px}
+.set-label .note{font:600 10px/1 var(--f-jp);color:var(--dim);margin-left:6px}
 .segmented{position:relative;display:grid;grid-template-columns:repeat(3,1fr);margin-top:9px;padding:3px;background:rgba(2,8,18,.75);border:1px solid var(--line);
   clip-path:polygon(6px 0,100% 0,100% calc(100% - 6px),calc(100% - 6px) 100%,0 100%,0 6px)}
 .seg-ind{position:absolute;top:3px;bottom:3px;left:3px;width:calc((100% - 6px)/3);transform:translateX(calc(var(--i,1)*100%));
@@ -503,12 +503,21 @@ img{-webkit-user-drag:none;user-select:none;-webkit-user-select:none}
         <div class="divider"></div>
         <div id="visibilitySetting" class="vis">
           <div class="set-label">相手の残数表示<span class="note" id="visNote">EXTREME MODE のみ</span><small>OPPONENT INFO</small></div>
-          <div class="segmented" id="segmented">
+          <div class="segmented" data-key="visibility">
             <span class="seg-ind" aria-hidden="true"></span>
-            <button class="seg" type="button" data-vis="detail">詳細</button>
-            <button class="seg on" type="button" data-vis="total">合計のみ</button>
-            <button class="seg" type="button" data-vis="hidden">非表示</button>
+            <button class="seg" type="button" data-val="detail">詳細</button>
+            <button class="seg" type="button" data-val="total">合計のみ</button>
+            <button class="seg" type="button" data-val="hidden">非表示</button>
           </div>
+        </div>
+
+        <div class="divider"></div>
+        <div class="set-label">CPUの強さ<span class="note">CPU対戦のみ</span><small>CPU LEVEL</small></div>
+        <div class="segmented" data-key="cpu">
+          <span class="seg-ind" aria-hidden="true"></span>
+          <button class="seg" type="button" data-val="easy">よわい</button>
+          <button class="seg" type="button" data-val="normal">ふつう</button>
+          <button class="seg" type="button" data-val="hard">つよい</button>
         </div>
       </div>
 
@@ -713,7 +722,21 @@ const Engine={
 /* =====================================================================
    画面の状態
    ===================================================================== */
-const S={mode:'extreme',n:10,visibility:'total'};   // タイトルの設定
+const S={mode:'extreme',n:10,visibility:'total',cpu:'normal'};   // タイトルの設定
+// CPUの強さ  delay:行動間隔(ms) react:相手が出した直後の反応時間 smart:残数バランスを考える確率 hesitate:様子見する確率
+const CPU_LEVELS={
+  easy:  {label:'EASY',  delay:[1000,1800],react:650,smart:0,  hesitate:.18},
+  normal:{label:'NORMAL',delay:[650,1250], react:380,smart:.5, hesitate:.06},
+  hard:  {label:'HARD',  delay:[380,800],  react:0,  smart:1,  hesitate:0}
+};
+const SETTINGS_KEY='extreme-speed:settings';
+try{const v=JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}');
+  if(['extreme','card'].includes(v.mode))S.mode=v.mode;
+  if(v.n>=8&&v.n<=20)S.n=v.n|0;
+  if(VIS_LABEL[v.visibility])S.visibility=v.visibility;
+  if(CPU_LEVELS[v.cpu])S.cpu=v.cpu;
+}catch(e){}
+function saveSettings(){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(S))}catch(e){}}
 let G=null;          // 表示中のゲーム状態
 let net=null;        // Local または Online
 let me='p1', opp='p2';
@@ -733,22 +756,34 @@ const Local={
   now:()=>Date.now(),
   visibility:()=>S.visibility,
   start(){clearTimeout(this.t);G=Engine.create(S.mode,S.n,Date.now()+LOCAL_READY_MS);me='p1';opp='p2';resetView();onState();this.schedule()},
-  play(lane,pick){const r=Engine.play(G,me,lane,pick,Date.now());onState();if(r==='ok')this.schedule(true);return Promise.resolve(r==='ok'?'ok':'blocked')},
-  schedule(keep){
-    if(keep&&this.t)return;
+  level:()=>CPU_LEVELS[S.cpu]||CPU_LEVELS.normal,
+  play(lane,pick){
+    const r=Engine.play(G,me,lane,pick,Date.now());onState();
+    if(r==='ok'){
+      // 場が変わった直後は反応時間ぶん待たせる（弱いCPUほど長い）
+      const react=this.level().react;
+      if(this.t&&this.due-Date.now()<react)this.schedule(react);
+    }
+    return Promise.resolve(r==='ok'?'ok':'blocked');
+  },
+  schedule(min){
     clearTimeout(this.t);this.t=null;if(!G||G.over)return;
-    const now=Date.now(),wait=Math.max(0,G.startAt-now,G.lockUntil-now);
-    this.t=setTimeout(()=>{this.t=null;this.cpu()},wait+380+Math.floor(Math.random()*420));
+    const L=this.level(),now=Date.now(),wait=Math.max(0,G.startAt-now,G.lockUntil-now);
+    const d=Math.max(min||0,wait+L.delay[0]+Math.floor(Math.random()*(L.delay[1]-L.delay[0])));
+    this.due=now+d;this.t=setTimeout(()=>{this.t=null;this.cpu()},d);
   },
   cpu(){
     if(!G||G.over||net!==this)return;
-    const moves=Engine.moves(G,'p2');
-    if(moves.length){
-      // 少しだけ在庫バランスを意識するCPU
-      const c=G.sides.p2.counts;
-      moves.sort((a,b)=>G.mode==='extreme'?c[b.type]-c[a.type]:Math.random()-.5);
-      const top=Math.min(moves.length,Math.random()<.72?2:moves.length);
-      const m=moves[Math.floor(Math.random()*top)];
+    const L=this.level(),moves=Engine.moves(G,'p2');
+    if(moves.length&&Math.random()>=L.hesitate){
+      let m;
+      if(G.mode==='extreme'&&Math.random()<L.smart){
+        // 残数の多い手を優先して、特定の手だけが残らないようにする
+        const c=G.sides.p2.counts;
+        moves.sort((a,b)=>c[b.type]-c[a.type]);
+        const top=Math.min(moves.length,Math.random()<.72?2:moves.length);
+        m=moves[Math.floor(Math.random()*top)];
+      }else m=moves[Math.floor(Math.random()*moves.length)];
       Engine.play(G,'p2',m.lane,m.pick,Date.now());onState();
     }
     this.schedule();
@@ -937,7 +972,7 @@ function render(){
   const online=net.kind==='online';
   $('#gameModeTitle').innerHTML=(G.mode==='extreme'?'EXTREME MODE':'CARD MODE')+`<small>${online?'ONLINE MATCH':'CPU MATCH'}</small>`;
   $('#oppName').textContent=online?'RIVAL':'CPU';
-  $('#oppSub').textContent=online?'ROOM '+(Online.code()||''):'NORMAL';
+  $('#oppSub').textContent=online?'ROOM '+(Online.code()||''):Local.level().label;
   $('#restartBtn').hidden=online;
   renderOpponent();
 
@@ -1163,7 +1198,12 @@ function syncMenu(){
   $('#totalValue').textContent=`${n*3} ${ex?'HANDS':'CARDS'}`;
   $('#visibilitySetting').classList.toggle('disabled',!ex);
   $('#visNote').textContent=ex?'':'CARD MODEは合計のみ';
-  $('.seg-ind').style.setProperty('--i',['detail','total','hidden'].indexOf(S.visibility));
+  $$('.segmented').forEach(g=>{
+    const btns=[...g.querySelectorAll('.seg')],i=btns.findIndex(b=>b.dataset.val===S[g.dataset.key]);
+    btns.forEach((b,j)=>b.classList.toggle('on',j===i));g.querySelector('.seg-ind').style.setProperty('--i',i);
+  });
+  slider.value=n;$$('.mode-card').forEach(x=>{x.classList.toggle('selected',x.dataset.mode===S.mode);x.setAttribute('aria-pressed',x.dataset.mode===S.mode)});
+  saveSettings();
 }
 $$('.mode-card').forEach(b=>b.addEventListener('click',()=>{
   S.mode=b.dataset.mode;
@@ -1174,7 +1214,7 @@ slider.addEventListener('input',()=>{
   S.n=Number(slider.value);syncMenu();
   countValue.classList.remove('tick');void countValue.offsetWidth;countValue.classList.add('tick');
 });
-$$('.seg').forEach(b=>b.addEventListener('click',()=>{S.visibility=b.dataset.vis;$$('.seg').forEach(x=>x.classList.toggle('on',x===b));syncMenu()}));
+$$('.segmented').forEach(g=>g.querySelectorAll('.seg').forEach(b=>b.addEventListener('click',()=>{S[g.dataset.key]=b.dataset.val;syncMenu()})));
 
 $('#startBtn').addEventListener('click',startCpuGame);
 $('#onlineBtn').addEventListener('click',()=>Lobby.open());
