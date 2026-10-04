@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""src/index.template.html の {{asset:相対パス}} を Base64 data URI に置換し、
-単体で動作する index.html を出力する。
+"""src/index.template.html を単体で動作する index.html にビルドする。
+
+  {{asset:相対パス}} … Base64 data URI に置換
+  {{json:相対パス}}  … JSON ファイルの中身に置換（ファイルが無ければ null）
 
   python3 tools/build.py
 """
 import base64
+import json
 import mimetypes
 import pathlib
 import re
@@ -33,7 +36,15 @@ def main() -> None:
             cache[rel] = data_uri(rel)
         return cache[rel]
 
+    def json_repl(m: re.Match) -> str:
+        path = ROOT / m.group(1)
+        if not path.exists():
+            print(f"note: {m.group(1)} が無いため null を埋め込みます")
+            return "null"
+        return json.dumps(json.loads(path.read_text(encoding="utf-8")), ensure_ascii=False)
+
     out = re.sub(r"\{\{asset:([^}]+)\}\}", repl, html)
+    out = re.sub(r"\{\{json:([^}]+)\}\}", json_repl, out)
     OUT.write_text(out, encoding="utf-8")
     print(f"wrote {OUT.relative_to(ROOT)} ({OUT.stat().st_size / 1024:.0f} KB, {len(cache)} assets)")
 
